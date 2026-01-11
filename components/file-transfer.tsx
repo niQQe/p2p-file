@@ -106,6 +106,15 @@ export function FileTransfer() {
             toast.success("Peer connected!");
         });
 
+        peer.on("close", () => {
+            console.log("Peer connection closed");
+            setPeerConnected(false);
+            setIncomingFile(null);
+            setReceivedFile(null);
+            setTransferStats(null);
+            toast.error("Peer disconnected");
+        });
+
         peer.on("data", (data) => {
             try {
                 const text = new TextDecoder().decode(data);
@@ -202,7 +211,8 @@ export function FileTransfer() {
         setIsTransferring(true);
         const startTime = Date.now();
 
-        const chunkSize = 64 * 1024; // 64KB for better throughput
+        // 256KB chunk size for efficient WebRTC throughput
+        const chunkSize = 256 * 1024;
         const totalChunks = Math.ceil(file.size / chunkSize);
 
         // Send metadata
@@ -216,25 +226,51 @@ export function FileTransfer() {
 
         const arrayBuffer = await file.arrayBuffer();
 
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const peer = peerRef.current as any; // Cast to access _channel
+
+        // Hysteresis Backpressure configuration
+        // We fill buffer up to 1MB, then wait until it drains to 256KB
+        const HIGH_WATER_MARK = 1024 * 1024; // 1MB
+        const LOW_WATER_MARK = 256 * 1024;   // 256KB
+
         for (let i = 0; i < totalChunks; i++) {
             const start = i * chunkSize;
             const end = Math.min(start + chunkSize, file.size);
             const chunk = arrayBuffer.slice(start, end);
 
-            // Simple backpressure: wait a tiny bit if needed, or just blast away for small files.
-            // For true backpressure we'd check peerRef.current._channel.bufferedAmount
-            // But simple-peer doesn't expose it easily in public API without casting.
-            // Let's rely on simple-peer internal buffer + a small tick delay to let loop breathe.
-            peerRef.current.send(chunk);
+            // Backpressure: If buffer is full, wait for it to drain significantly
+            if (peer._channel && peer._channel.bufferedAmount > HIGH_WATER_MARK) {
+                while (peer._channel.bufferedAmount > LOW_WATER_MARK) {
+                    await new Promise(r => setTimeout(r, 1)); // Minimal wait loop
+                }
+            }
 
-            // Update progress
-            setTransferProgress(Math.round(((i + 1) / totalChunks) * 100));
+            try {
+                peer.send(chunk);
+            } catch (err) {
+                console.error("Send error", err);
+                // If send fails, brief pause
+                await new Promise(r => setTimeout(r, 5));
+            }
 
-            // Allow UI to update and buffer to drain slightly
-            await new Promise(r => setTimeout(r, 10));
+            // Update stats sparingly - every 40 chunks (~10MB) or last chunk
+            if (i % 40 === 0 || i === totalChunks - 1) {
+                const elapsed = (Date.now() - startTime) / 1000;
+                if (elapsed > 0) {
+                    const bytesSent = (i + 1) * chunkSize;
+                    const speed = formatSpeed(bytesSent / elapsed);
+                    setTransferStats({ speed: speed + " (Upload)", timeLeft: "" });
+                }
+                setTransferProgress(Math.round(((i + 1) / totalChunks) * 100));
+
+                // Yield very briefly to keep UI responsive
+                await new Promise(r => setTimeout(r, 0));
+            }
         }
 
         setIsTransferring(false);
+        setTransferStats(null);
         toast.success("File sent!");
     };
 
