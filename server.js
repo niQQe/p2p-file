@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-require-imports */
 const { createServer } = require("http");
 const { parse } = require("url");
 const next = require("next");
@@ -18,14 +19,34 @@ app.prepare().then(() => {
 
     const io = new Server(httpServer);
 
+    // Socket.io setup - track all users in each room
+    const rooms = new Map(); // roomId -> Set of socket IDs
+
     io.on("connection", (socket) => {
         console.log("Client connected:", socket.id);
 
         socket.on("join-room", (roomId) => {
             socket.join(roomId);
-            console.log(`Socket ${socket.id} joined room ${roomId}`);
-            // Notify others in room
-            socket.to(roomId).emit("user-connected", socket.id);
+
+            // Initialize room if it doesn't exist
+            if (!rooms.has(roomId)) {
+                rooms.set(roomId, new Set());
+            }
+
+            const room = rooms.get(roomId);
+
+            // Notify all existing users in the room about the new user
+            room.forEach(existingUserId => {
+
+
+                // Tell each existing user about the new user
+                io.to(existingUserId).emit("user-connected", socket.id);
+            });
+
+            // Add the new user to the room
+            room.add(socket.id);
+
+            console.log(`Socket ${socket.id} joined room ${roomId}. Total users: ${room.size}`);
         });
 
         socket.on("offer", (data) => {
@@ -42,6 +63,23 @@ app.prepare().then(() => {
 
         socket.on("disconnect", () => {
             console.log("Client disconnected:", socket.id);
+
+            // Remove user from all rooms
+            rooms.forEach((userSet, roomId) => {
+                if (userSet.has(socket.id)) {
+                    userSet.delete(socket.id);
+
+                    // Notify remaining users
+                    userSet.forEach(userId => {
+                        io.to(userId).emit("user-disconnected", socket.id);
+                    });
+
+                    // Clean up empty rooms
+                    if (userSet.size === 0) {
+                        rooms.delete(roomId);
+                    }
+                }
+            });
         });
     });
 
