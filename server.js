@@ -17,15 +17,76 @@ app.prepare().then(() => {
         handle(req, res, parsedUrl);
     });
 
-    const io = new Server(httpServer);
+    const io = new Server(httpServer, {
+        cors: {
+            origin: process.env.ALLOWED_ORIGINS?.split(',') || [
+                'http://localhost:3000',
+                'http://127.0.0.1:3000',
+                'https://p2p-file-production.up.railway.app'
+            ],
+            methods: ['GET', 'POST'],
+            credentials: true
+        },
+        pingTimeout: 60000,
+        pingInterval: 25000,
+        maxHttpBufferSize: 1e8, // 100 MB max message size
+        transports: ['websocket', 'polling']
+    });
 
-    // Socket.io setup - track all users in each room
+    // Security configuration
+    const SECURITY_CONFIG = {
+        maxConnectionsPerIP: 5,
+        maxUsersPerRoom: 20,
+        maxRooms: 1000,
+        connectionTimeout: 30 * 60 * 1000, // 30 minutes
+        maxRoomIdLength: 50
+    };
+
+    // Tracking structures
     const rooms = new Map(); // roomId -> Set of socket IDs
+    const ipConnections = new Map(); // IP -> count
+    const socketIPs = new Map(); // socketId -> IP
+    const connectionTimes = new Map(); // socketId -> timestamp
 
     io.on("connection", (socket) => {
-        console.log("Client connected:", socket.id);
+        // Get client IP
+        const clientIP = socket.handshake.headers['x-forwarded-for']?.split(',')[0] ||
+            socket.handshake.address;
+
+        // Rate limiting: Check connections per IP
+        const currentConnections = ipConnections.get(clientIP) || 0;
+        if (currentConnections >= SECURITY_CONFIG.maxConnectionsPerIP) {
+            console.log(`Rejected connection from ${clientIP}: too many connections (${currentConnections})`);
+            socket.emit("error", { message: "Too many connections from your IP" });
+            socket.disconnect();
+            return;
+        }
+
+        // Track connection
+        ipConnections.set(clientIP, currentConnections + 1);
+        socketIPs.set(socket.id, clientIP);
+        connectionTimes.set(socket.id, Date.now());
+
+        console.log(`Client connected: ${socket.id} from ${clientIP}`);
 
         socket.on("join-room", (roomId) => {
+            // Validate room ID
+            if (!roomId || typeof roomId !== 'string') {
+                socket.emit("error", { message: "Invalid room ID" });
+                return;
+            }
+
+            if (roomId.length > SECURITY_CONFIG.maxRoomIdLength) {
+                socket.emit("error", { message: "Room ID too long" });
+                return;
+            }
+
+            // Check max rooms limit
+            if (rooms.size >= SECURITY_CONFIG.maxRooms && !rooms.has(roomId)) {
+                socket.emit("error", { message: "Server capacity reached" });
+                return;
+            }
+
             socket.join(roomId);
 
             // Initialize room if it doesn't exist
@@ -34,6 +95,13 @@ app.prepare().then(() => {
             }
 
             const room = rooms.get(roomId);
+
+            // Check room size limit
+            if (room.size >= SECURITY_CONFIG.maxUsersPerRoom) {
+                socket.emit("error", { message: "Room is full" });
+                socket.leave(roomId);
+                return;
+            }
 
             // Notify all existing users in the room about the new user
             room.forEach(existingUserId => {
@@ -50,19 +118,40 @@ app.prepare().then(() => {
         });
 
         socket.on("offer", (data) => {
-            socket.to(data.to).emit("offer", { offer: data.offer, from: socket.id });
+            if (data?.to && typeof data.to === 'string') {
+                socket.to(data.to).emit("offer", { offer: data.offer, from: socket.id });
+            }
         });
 
         socket.on("answer", (data) => {
-            socket.to(data.to).emit("answer", { answer: data.answer, from: socket.id });
+            if (data?.to && typeof data.to === 'string') {
+                socket.to(data.to).emit("answer", { answer: data.answer, from: socket.id });
+            }
         });
 
         socket.on("ice-candidate", (data) => {
-            socket.to(data.to).emit("ice-candidate", { candidate: data.candidate, from: socket.id });
+            if (data?.to && typeof data.to === 'string') {
+                socket.to(data.to).emit("ice-candidate", { candidate: data.candidate, from: socket.id });
+            }
         });
 
         socket.on("disconnect", () => {
             console.log("Client disconnected:", socket.id);
+
+            // Clean up IP tracking
+            const ip = socketIPs.get(socket.id);
+            if (ip) {
+                const count = ipConnections.get(ip) || 1;
+                if (count <= 1) {
+                    ipConnections.delete(ip);
+                } else {
+                    ipConnections.set(ip, count - 1);
+                }
+                socketIPs.delete(socket.id);
+            }
+
+            // Clean up connection time tracking
+            connectionTimes.delete(socket.id);
 
             // Remove user from all rooms
             rooms.forEach((userSet, roomId) => {
